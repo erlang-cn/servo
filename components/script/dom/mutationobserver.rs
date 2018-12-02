@@ -14,6 +14,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::mutationrecord::MutationRecord;
 use crate::dom::node::Node;
+use crate::dom::nodelist::LiveListGenerator;
 use crate::dom::window::Window;
 use crate::microtask::Microtask;
 use crate::script_thread::ScriptThread;
@@ -48,9 +49,15 @@ pub enum Mutation<'a> {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-pub struct RegisteredObserver {
-    pub observer: DomRoot<MutationObserver>,
-    options: ObserverOptions,
+pub enum RegisteredObserver {
+    Mutation {
+        observer: DomRoot<MutationObserver>,
+        options: ObserverOptions,
+    },
+    LiveDom(
+        #[ignore_malloc_size_of = "Contains a trait object; can't measure due to #6870"]
+        Rc<dyn LiveListGenerator + 'static>,
+    ),
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -133,76 +140,76 @@ impl MutationObserver {
         // Step 2 & 3
         for node in target.inclusive_ancestors() {
             for registered in &*node.registered_mutation_observers() {
-                if &*node != target && !registered.options.subtree {
-                    continue;
-                }
+                match registered {
+                    RegisteredObserver::LiveDom(gen) => gen.invalidate_cache(),
+                    RegisteredObserver::Mutation { observer, options } => {
+                        if &*node != target && !options.subtree {
+                            continue;
+                        }
 
-                match attr_type {
-                    Mutation::Attribute {
-                        ref name,
-                        ref namespace,
-                        ref old_value,
-                    } => {
-                        // Step 3.1
-                        if !registered.options.attributes {
-                            continue;
+                        match attr_type {
+                            Mutation::Attribute {
+                                ref name,
+                                ref namespace,
+                                ref old_value,
+                            } => {
+                                // Step 3.1
+                                if !options.attributes {
+                                    continue;
+                                }
+                                if !options.attribute_filter.is_empty() {
+                                    if *namespace != ns!() {
+                                        continue;
+                                    }
+                                    if !options.attribute_filter.iter().any(|s| &**s == &**name) {
+                                        continue;
+                                    }
+                                }
+                                // Step 3.1.2
+                                let paired_string = if options.attribute_old_value {
+                                    old_value.clone()
+                                } else {
+                                    None
+                                };
+                                // Step 3.1.1
+                                let idx = interested_observers.iter().position(|&(ref o, _)| {
+                                    &**o as *const _ == &**observer as *const _
+                                });
+                                if let Some(idx) = idx {
+                                    interested_observers[idx].1 = paired_string;
+                                } else {
+                                    interested_observers
+                                        .push((DomRoot::from_ref(&*observer), paired_string));
+                                }
+                            },
+                            Mutation::CharacterData { ref old_value } => {
+                                if !options.character_data {
+                                    continue;
+                                }
+                                // Step 3.1.2
+                                let paired_string = if options.character_data_old_value {
+                                    Some(old_value.clone())
+                                } else {
+                                    None
+                                };
+                                // Step 3.1.1
+                                let idx = interested_observers.iter().position(|&(ref o, _)| {
+                                    &**o as *const _ == &**observer as *const _
+                                });
+                                if let Some(idx) = idx {
+                                    interested_observers[idx].1 = paired_string;
+                                } else {
+                                    interested_observers
+                                        .push((DomRoot::from_ref(&*observer), paired_string));
+                                }
+                            },
+                            Mutation::ChildList { .. } => {
+                                if !options.child_list {
+                                    continue;
+                                }
+                                interested_observers.push((DomRoot::from_ref(&*observer), None));
+                            },
                         }
-                        if !registered.options.attribute_filter.is_empty() {
-                            if *namespace != ns!() {
-                                continue;
-                            }
-                            if !registered
-                                .options
-                                .attribute_filter
-                                .iter()
-                                .any(|s| &**s == &**name)
-                            {
-                                continue;
-                            }
-                        }
-                        // Step 3.1.2
-                        let paired_string = if registered.options.attribute_old_value {
-                            old_value.clone()
-                        } else {
-                            None
-                        };
-                        // Step 3.1.1
-                        let idx = interested_observers.iter().position(|&(ref o, _)| {
-                            &**o as *const _ == &*registered.observer as *const _
-                        });
-                        if let Some(idx) = idx {
-                            interested_observers[idx].1 = paired_string;
-                        } else {
-                            interested_observers
-                                .push((DomRoot::from_ref(&*registered.observer), paired_string));
-                        }
-                    },
-                    Mutation::CharacterData { ref old_value } => {
-                        if !registered.options.character_data {
-                            continue;
-                        }
-                        // Step 3.1.2
-                        let paired_string = if registered.options.character_data_old_value {
-                            Some(old_value.clone())
-                        } else {
-                            None
-                        };
-                        // Step 3.1.1
-                        let idx = interested_observers.iter().position(|&(ref o, _)| {
-                            &**o as *const _ == &*registered.observer as *const _
-                        });
-                        if let Some(idx) = idx {
-                            interested_observers[idx].1 = paired_string;
-                        } else {
-                            interested_observers
-                                .push((DomRoot::from_ref(&*registered.observer), paired_string));
-                        }
-                    },
-                    Mutation::ChildList { .. } => {
-                        if !registered.options.child_list {
-                            continue;
-                        }
-                        interested_observers.push((DomRoot::from_ref(&*registered.observer), None));
                     },
                 }
             }
@@ -298,20 +305,20 @@ impl MutationObserverMethods for MutationObserver {
         let add_new_observer = {
             let mut replaced = false;
             for registered in &mut *target.registered_mutation_observers() {
-                if &*registered.observer as *const MutationObserver !=
-                    self as *const MutationObserver
-                {
-                    continue;
+                if let RegisteredObserver::Mutation { observer, options } = registered {
+                    if &**observer as *const MutationObserver != self as *const MutationObserver {
+                        continue;
+                    }
+                    // TODO: remove matching transient registered observers
+                    options.attribute_old_value = attribute_old_value;
+                    options.attributes = attributes;
+                    options.character_data = character_data;
+                    options.character_data_old_value = character_data_old_value;
+                    options.child_list = child_list;
+                    options.subtree = subtree;
+                    options.attribute_filter = attribute_filter.clone();
+                    replaced = true;
                 }
-                // TODO: remove matching transient registered observers
-                registered.options.attribute_old_value = attribute_old_value;
-                registered.options.attributes = attributes;
-                registered.options.character_data = character_data;
-                registered.options.character_data_old_value = character_data_old_value;
-                registered.options.child_list = child_list;
-                registered.options.subtree = subtree;
-                registered.options.attribute_filter = attribute_filter.clone();
-                replaced = true;
             }
             !replaced
         };
@@ -320,7 +327,7 @@ impl MutationObserverMethods for MutationObserver {
         if add_new_observer {
             target
                 .registered_mutation_observers()
-                .push(RegisteredObserver {
+                .push(RegisteredObserver::Mutation {
                     observer: DomRoot::from_ref(self),
                     options: ObserverOptions {
                         attributes,
