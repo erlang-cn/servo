@@ -74,11 +74,12 @@ use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::location::Location;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::mouseevent::MouseEvent;
+use crate::dom::mutationobserver::RegisteredObserver;
 use crate::dom::node::VecPreOrderInsertionHelper;
 use crate::dom::node::{self, document_from_node, window_from_node, CloneChildrenFlag};
 use crate::dom::node::{LayoutNodeHelpers, Node, NodeDamage, NodeFlags};
 use crate::dom::nodeiterator::NodeIterator;
-use crate::dom::nodelist::NodeList;
+use crate::dom::nodelist::{LiveListGenerator, NodeList};
 use crate::dom::pagetransitionevent::PageTransitionEvent;
 use crate::dom::popstateevent::PopStateEvent;
 use crate::dom::processinginstruction::ProcessingInstruction;
@@ -2762,16 +2763,6 @@ impl Document {
         self.redirect_count.set(count)
     }
 
-    fn create_node_list<F: Fn(&Node) -> bool>(&self, callback: F) -> DomRoot<NodeList> {
-        let doc = self.GetDocumentElement();
-        let maybe_node = doc.r().map(Castable::upcast::<Node>);
-        let iter = maybe_node
-            .iter()
-            .flat_map(|node| node.traverse_preorder())
-            .filter(|node| callback(&node));
-        NodeList::new_simple_list(&self.window, iter)
-    }
-
     fn get_html_element(&self) -> Option<DomRoot<HTMLHtmlElement>> {
         self.GetDocumentElement().and_then(DomRoot::downcast)
     }
@@ -3852,19 +3843,77 @@ impl DocumentMethods for Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-getelementsbyname
+    #[allow(unrooted_must_root)]
     fn GetElementsByName(&self, name: DOMString) -> DomRoot<NodeList> {
-        self.create_node_list(|node| {
-            let element = match node.downcast::<Element>() {
-                Some(element) => element,
-                None => return false,
-            };
-            if element.namespace() != &ns!(html) {
-                return false;
+        #[derive(JSTraceable, MallocSizeOf)]
+        #[must_root]
+        struct LiveElements {
+            node: Dom<Node>,
+            name: DOMString,
+            cached: DomRefCell<Option<Vec<Dom<Node>>>>,
+        }
+
+        impl LiveListGenerator for LiveElements {
+            fn get_list(&self) -> Ref<Vec<Dom<Node>>> {
+                if self.cached.borrow().is_some() {
+                    return Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap());
+                }
+                self.generate()
             }
-            element
-                .get_attribute(&ns!(), &local_name!("name"))
-                .map_or(false, |attr| &**attr.value() == &*name)
-        })
+
+            fn invalidate_cache(&self) {
+                *self.cached.borrow_mut() = None;
+            }
+
+            fn generate(&self) -> Ref<Vec<Dom<Node>>> {
+                let name = self.name.clone();
+                let iter = self
+                    .node
+                    .traverse_preorder()
+                    .filter(move |node| {
+                        let element = match node.downcast::<Element>() {
+                            Some(element) => element,
+                            None => return false,
+                        };
+                        if element.namespace() != &ns!(html) {
+                            return false;
+                        }
+                        element
+                            .get_attribute(&ns!(), &local_name!("name"))
+                            .map_or(false, |attr| &**attr.value() == &*name)
+                    })
+                    .map(|node| Dom::from_ref(&*node));
+
+                *self.cached.borrow_mut() = Some(iter.collect());
+                Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap())
+            }
+        }
+
+        impl Drop for LiveElements {
+            fn drop(&mut self) {
+                self.node
+                    .registered_mutation_observers()
+                    .retain(|reg_obs| match reg_obs {
+                        RegisteredObserver::LiveDom(gen) => {
+                            &**gen as *const dyn LiveListGenerator !=
+                                self as *const dyn LiveListGenerator
+                        },
+                        _ => false,
+                    });
+            }
+        }
+
+        let live_elements = Rc::new(LiveElements {
+            node: Dom::from_ref(self.upcast::<Node>()),
+            name,
+            cached: DomRefCell::new(None),
+        });
+
+        self.upcast::<Node>()
+            .registered_mutation_observers()
+            .push(RegisteredObserver::LiveDom(live_elements.clone()));
+
+        NodeList::new_live_list(&self.window, live_elements)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-images

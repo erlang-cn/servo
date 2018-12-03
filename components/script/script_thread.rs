@@ -1268,33 +1268,38 @@ impl ScriptThread {
 
         // Process the gathered events.
         debug!("Processing events.");
-        for msg in sequential {
-            debug!("Processing event {:?}.", msg);
-
-            let category = self.categorize_msg(&msg);
-            let pipeline_id = self.message_to_pipeline(&msg);
-
-            let result = self.profile_event(category, pipeline_id, move || {
-                match msg {
-                    FromConstellation(ConstellationControlMsg::ExitScriptThread) => {
-                        self.handle_exit_script_thread_msg();
-                        return Some(false);
-                    },
-                    FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
-                    FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
-                    FromScheduler(inner_msg) => self.handle_timer_event(inner_msg),
-                    FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
-                    FromImageCache(inner_msg) => self.handle_msg_from_image_cache(inner_msg),
-                }
-
-                None
-            });
-
-            // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
+        if sequential.is_empty() {
+            // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 7
             self.perform_a_microtask_checkpoint();
+        } else {
+            for msg in sequential {
+                debug!("Processing event {:?}.", msg);
 
-            if let Some(retval) = result {
-                return retval;
+                let category = self.categorize_msg(&msg);
+                let pipeline_id = self.message_to_pipeline(&msg);
+
+                let result = self.profile_event(category, pipeline_id, move || {
+                    match msg {
+                        FromConstellation(ConstellationControlMsg::ExitScriptThread) => {
+                            self.handle_exit_script_thread_msg();
+                            return Some(false);
+                        },
+                        FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
+                        FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
+                        FromScheduler(inner_msg) => self.handle_timer_event(inner_msg),
+                        FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
+                        FromImageCache(inner_msg) => self.handle_msg_from_image_cache(inner_msg),
+                    }
+
+                    None
+                });
+
+                // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 7
+                self.perform_a_microtask_checkpoint();
+
+                if let Some(retval) = result {
+                    return retval;
+                }
             }
         }
 

@@ -4,6 +4,7 @@
 
 use crate::dom::activation::{synthetic_click_activation, ActivationSource};
 use crate::dom::attr::Attr;
+use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding;
@@ -27,14 +28,16 @@ use crate::dom::htmlframesetelement::HTMLFrameSetElement;
 use crate::dom::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::htmllabelelement::HTMLLabelElement;
+use crate::dom::mutationobserver::RegisteredObserver;
 use crate::dom::node::{document_from_node, window_from_node};
 use crate::dom::node::{Node, NodeFlags};
-use crate::dom::nodelist::NodeList;
+use crate::dom::nodelist::{LiveListGenerator, NodeList};
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::VirtualMethods;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use script_layout_interface::message::QueryMsg;
+use std::cell::Ref;
 use std::collections::HashSet;
 use std::default::Default;
 use std::rc::Rc;
@@ -677,43 +680,94 @@ impl HTMLElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-lfe-labels
+    #[allow(unrooted_must_root)]
     pub fn labels(&self) -> DomRoot<NodeList> {
         debug_assert!(self.is_labelable_element());
 
-        let element = self.upcast::<Element>();
-        let window = window_from_node(element);
+        #[derive(JSTraceable, MallocSizeOf)]
+        #[must_root]
+        struct LiveLabels {
+            html_element: Dom<HTMLElement>,
+            cached: DomRefCell<Option<Vec<Dom<Node>>>>,
+        }
 
-        // Traverse ancestors for implicitly associated <label> elements
-        // https://html.spec.whatwg.org/multipage/#the-label-element:attr-label-for-4
-        let ancestors = self
-            .upcast::<Node>()
-            .ancestors()
-            .filter_map(DomRoot::downcast::<HTMLElement>)
-            // If we reach a labelable element, we have a guarantee no ancestors above it
-            // will be a label for this HTMLElement
-            .take_while(|elem| !elem.is_labelable_element())
-            .filter_map(DomRoot::downcast::<HTMLLabelElement>)
-            .filter(|elem| !elem.upcast::<Element>().has_attribute(&local_name!("for")))
-            .filter(|elem| elem.first_labelable_descendant().r() == Some(self))
-            .map(DomRoot::upcast::<Node>);
+        impl LiveListGenerator for LiveLabels {
+            fn get_list(&self) -> Ref<Vec<Dom<Node>>> {
+                if self.cached.borrow().is_some() {
+                    return Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap());
+                }
+                self.generate()
+            }
 
-        let id = element.Id();
-        let id = match &id as &str {
-            "" => return NodeList::new_simple_list(&window, ancestors),
-            id => id,
-        };
+            fn invalidate_cache(&self) {
+                *self.cached.borrow_mut() = None;
+            }
 
-        // Traverse entire tree for <label> elements with `for` attribute matching `id`
-        let root_element = element.root_element();
-        let root_node = root_element.upcast::<Node>();
-        let children = root_node
-            .traverse_preorder()
-            .filter_map(DomRoot::downcast::<Element>)
-            .filter(|elem| elem.is::<HTMLLabelElement>())
-            .filter(|elem| elem.get_string_attribute(&local_name!("for")) == id)
-            .map(DomRoot::upcast::<Node>);
+            fn generate(&self) -> Ref<Vec<Dom<Node>>> {
+                let element = self.html_element.upcast::<Element>();
+                let html_element = DomRoot::from_ref(&*self.html_element);
 
-        NodeList::new_simple_list(&window, children.chain(ancestors))
+                let ancestors = self
+                    .html_element
+                    .upcast::<Node>()
+                    .ancestors()
+                    .filter_map(DomRoot::downcast::<HTMLElement>)
+                    // If we reach a labelable element, we have a guarantee no ancestors above it
+                    // will be a label for this HTMLElement
+                    .take_while(|elem| !elem.is_labelable_element())
+                    .filter_map(DomRoot::downcast::<HTMLLabelElement>)
+                    .filter(|elem| !elem.upcast::<Element>().has_attribute(&local_name!("for")))
+                    .filter(move |elem| {
+                        elem.first_labelable_descendant().r() == Some(&*html_element)
+                    })
+                    .map(|elem| Dom::from_ref(&*DomRoot::upcast::<Node>(elem)));
+
+                let id = element.Id();
+                if id.is_empty() {
+                    *self.cached.borrow_mut() = Some(ancestors.collect());
+                    return Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap());
+                }
+
+                // Traverse entire tree for <label> elements with `for` attribute matching `id`
+                let root_element = element.root_element();
+                let root_node = root_element.upcast::<Node>();
+                let children = root_node
+                    .traverse_preorder()
+                    .filter_map(DomRoot::downcast::<Element>)
+                    .filter(|elem| elem.is::<HTMLLabelElement>())
+                    .filter(move |elem| elem.get_string_attribute(&local_name!("for")) == &*id)
+                    .map(|elem| Dom::from_ref(&*DomRoot::upcast::<Node>(elem)));
+
+                *self.cached.borrow_mut() = Some(children.chain(ancestors).collect());
+                Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap())
+            }
+        }
+
+        impl Drop for LiveLabels {
+            fn drop(&mut self) {
+                self.html_element
+                    .upcast::<Node>()
+                    .registered_mutation_observers()
+                    .retain(|reg_obs| match reg_obs {
+                        RegisteredObserver::LiveDom(gen) => {
+                            &**gen as *const dyn LiveListGenerator !=
+                                self as *const dyn LiveListGenerator
+                        },
+                        _ => false,
+                    });
+            }
+        }
+
+        let root = self.upcast::<Node>();
+        let window = window_from_node(root);
+        let live_labels = Rc::new(LiveLabels {
+            html_element: Dom::from_ref(self),
+            cached: DomRefCell::new(None),
+        });
+
+        root.registered_mutation_observers()
+            .push(RegisteredObserver::LiveDom(live_labels.clone()));
+        NodeList::new_live_list(&window, live_labels)
     }
 }
 
